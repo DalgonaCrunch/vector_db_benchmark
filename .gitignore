@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyo
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables (NEVER commit)
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Vector DB data (runtime, not source code)
+qdrant_data/
+storage/
+.bkit/
+
+# OpenSearch (downloaded binary ~400MB)
+.opensearch/
+*.tar.gz
+
+# Registry / uploaded PDF data (runtime state)
+data/index_registry.json
+data/registry.json
+data/pdfs/*.pdf
+
+# Benchmark outputs
+benchmark_results.csv
+*.csv
+
+# uv
+.uv/
+
+# Logs
+*.log
+logs/

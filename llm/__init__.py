@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from llm.base_provider import BaseLLMProvider
 from llm.claude_provider import ClaudeProvider
+from llm.gemini_provider import GeminiProvider
 from llm.openai_provider import OpenAIProvider
 from llm.upstage_provider import UpstageProvider
 
@@ -29,12 +30,14 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "Upstage": UpstageProvider.MODELS,
     "OpenAI": OpenAIProvider.MODELS,
     "Claude": ClaudeProvider.MODELS,
+    "Gemini": GeminiProvider.MODELS,
 }
 
 _PROVIDER_ENV: dict[str, str] = {
     "Upstage": "UPSTAGE_API_KEY",
     "OpenAI": "OPENAI_API_KEY",
     "Claude": "ANTHROPIC_API_KEY",
+    "Gemini": "GEMINI_API_KEY",
 }
 
 
@@ -65,6 +68,8 @@ def get_provider(name: str) -> BaseLLMProvider:
         return OpenAIProvider(api_key)
     if name == "Claude":
         return ClaudeProvider(api_key)
+    if name == "Gemini":
+        return GeminiProvider(api_key)
     raise ValueError(f"Unknown provider '{name}'")
 
 

@@ -33,11 +33,15 @@ from ingestion.index_ingestor import IndexIngestor, IngestResult
 from ingestion.index_registry import IndexRegistry, KBIndex, sanitize_index_name
 from ingestion.ingestion_config import (
     DISTANCE_TO_SPACE_TYPE,
+    LOADER_STRATEGIES,
     MODEL_DIMENSIONS,
+    SPLITTER_STRATEGIES,
     IngestionConfig,
     validate_ingestion_config,
 )
 from ingestion.loaders import FILE_LOADER_REGISTRY
+from ingestion.pkg_installer import check_strategy_deps, install_package
+from ingestion.strategy_info import LOADER_STRATEGY_INFO, SPLITTER_STRATEGY_INFO
 from stores.base_store import SearchResult
 from stores.opensearch_store import OpenSearchStoreConfig, OpenSearchVectorStore
 from stores.qdrant_store import QdrantStoreConfig, QdrantVectorStore
@@ -504,14 +508,119 @@ def _build_ingestion_config() -> IngestionConfig:
     return IngestionConfig(
         dbs=dbs,
         embedding_model=emb_model,
-        embedding_dimension=int(st.session_state.get("ing_emb_dim", MODEL_DIMENSIONS.get(emb_model, 4096))),
+        embedding_dimension=int(
+            st.session_state.get("ing_emb_dim", MODEL_DIMENSIONS.get(emb_model, 4096))
+        ),
         normalize=bool(st.session_state.get("ing_normalize", False)),
+        loader_strategy=st.session_state.get("ing_loader_strategy", "page"),
+        splitter_strategy=st.session_state.get("ing_splitter_strategy", "sliding_window"),
         chunk_size=int(st.session_state.get("ing_chunk_size", 650)),
         chunk_overlap=int(st.session_state.get("ing_chunk_overlap", 100)),
+        sentence_count=int(st.session_state.get("ing_sentence_count", 5)),
+        sentence_overlap=int(st.session_state.get("ing_sentence_overlap", 1)),
+        semantic_threshold=float(st.session_state.get("ing_semantic_threshold", 0.5)),
+        prepend_section_title=bool(st.session_state.get("ing_prepend_title", False)),
+        min_chunk_length=int(st.session_state.get("ing_min_chunk_len", 50)),
         batch_size=int(st.session_state.get("ing_batch_size", 32)),
         duplicate_policy=st.session_state.get("ing_dup_policy", "skip"),
-        metadata=json.loads(st.session_state.get("ing_metadata_json", "{}") or "{}"),
+        metadata={
+            **json.loads(st.session_state.get("ing_metadata_json", "{}") or "{}"),
+            # Pass per-type loader strategy map so ingestor can dispatch correctly
+            "_loader_strategy_map": st.session_state.get("ing_loader_strategy_map", {}),
+        },
     )
+
+
+# ---------------------------------------------------------------------------
+# Strategy info popup helpers
+# ---------------------------------------------------------------------------
+
+
+def _render_strategy_info_popup(info: dict) -> None:
+    """Render a strategy's detail card inside a st.popover."""
+    st.markdown(f"### {info.get('icon', '')} {info['name']}")
+    st.markdown(info["description"])
+    st.divider()
+
+    col_pro, col_con = st.columns(2)
+    with col_pro:
+        st.markdown("**✅ 장점**")
+        for p in info["pros"]:
+            st.markdown(f"- {p}")
+    with col_con:
+        st.markdown("**❌ 단점**")
+        for c in info["cons"]:
+            st.markdown(f"- {c}")
+
+    st.divider()
+    st.markdown(f"**🎯 추천 상황:** {info['recommended']}")
+
+    tags = "  ".join(f"`{t}`" for t in info.get("best_for", []))
+    if tags:
+        st.markdown(f"**🏷 Best for:** {tags}")
+
+    # Dependency status
+    requires = info.get("requires", [])
+    import_check = info.get("import_check")
+    if requires:
+        st.divider()
+        st.markdown("**📦 의존성**")
+        available, missing = check_strategy_deps(requires, import_check)
+        if available:
+            st.success(f"✅ 설치됨: {', '.join(requires)}")
+        else:
+            for pkg in missing:
+                c1, c2 = st.columns([3, 1])
+                c1.warning(f"⚠️ `{pkg}` 미설치")
+                if c2.button(f"설치", key=f"install_{pkg}_{info['name']}"):
+                    with st.spinner(f"`{pkg}` 설치 중…"):
+                        ok, msg = install_package(pkg)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"설치 실패: {msg}")
+
+
+def _strategy_selector_with_info(
+    label: str,
+    options: list[str],
+    info_dict: dict[str, dict],
+    session_key: str,
+    default_idx: int = 0,
+) -> str:
+    """
+    Render a selectbox + ℹ️ popover button side-by-side.
+    Returns the selected option string.
+    """
+    col_sel, col_info = st.columns([5, 1])
+    current = st.session_state.get(session_key, options[default_idx])
+    idx = options.index(current) if current in options else 0
+
+    selected = col_sel.selectbox(label, options, index=idx, key=session_key)
+
+    info = info_dict.get(selected, {})
+    icon = info.get("icon", "ℹ️")
+    with col_info:
+        st.write("")  # spacing
+        with st.popover(f"{icon} 정보"):
+            if info:
+                _render_strategy_info_popup(info)
+            else:
+                st.info("전략 정보가 없습니다.")
+
+    # Availability badge
+    requires = info.get("requires", [])
+    import_check = info.get("import_check")
+    if requires:
+        available, missing = check_strategy_deps(requires, import_check)
+        if not available:
+            st.warning(
+                f"⚠️ `{selected}` 전략에 필요한 패키지가 없습니다: "
+                f"{', '.join(missing)}  — ℹ️ 버튼을 눌러 설치하세요."
+            )
+
+    return selected
 
 
 def _run_batch_ingest(
@@ -635,7 +744,7 @@ def render_upload_tab() -> None:
     # ── Ingestion options ─────────────────────────────────────────────
     with st.expander("⚙️ Ingestion 옵션", expanded=True):
 
-        # DB selection
+        # ── DB selection ──────────────────────────────────────────────
         st.markdown("**💾 저장 DB 선택**")
         dbs = st.multiselect(
             "저장 대상 DB",
@@ -647,7 +756,7 @@ def render_upload_tab() -> None:
 
         st.divider()
 
-        # Embedding model
+        # ── Embedding model ───────────────────────────────────────────
         st.markdown("**🧠 Embedding 모델**")
         ec1, ec2 = st.columns([2, 1])
         emb_model = ec1.selectbox(
@@ -661,7 +770,7 @@ def render_upload_tab() -> None:
             ),
         )
         default_dim = MODEL_DIMENSIONS.get(emb_model, 1024)
-        emb_dim = ec2.number_input(
+        ec2.number_input(
             "Embedding Dimension",
             min_value=64,
             max_value=8192,
@@ -669,7 +778,7 @@ def render_upload_tab() -> None:
             step=64,
             key="ing_emb_dim",
         )
-        normalize = st.checkbox(
+        st.checkbox(
             "L2 Normalize",
             value=False,
             key="ing_normalize",
@@ -678,41 +787,140 @@ def render_upload_tab() -> None:
 
         st.divider()
 
-        # Chunk options
-        st.markdown("**✂️ Chunk 옵션**")
-        ck1, ck2 = st.columns(2)
-        chunk_size = ck1.slider(
-            "Chunk Size (tokens)",
-            min_value=100,
-            max_value=2000,
-            value=650,
-            step=50,
-            key="ing_chunk_size",
+        # ── Loader strategy ───────────────────────────────────────────
+        st.markdown("**📂 Document Loader 전략**")
+        st.caption(
+            "업로드할 파일 형식에 맞는 로딩 전략을 선택하세요. "
+            "ℹ️ 버튼으로 각 전략의 장단점을 확인할 수 있습니다."
         )
-        chunk_overlap = ck2.slider(
-            "Chunk Overlap (tokens)",
-            min_value=0,
-            max_value=500,
-            value=100,
-            step=25,
-            key="ing_chunk_overlap",
-        )
-        if chunk_overlap >= chunk_size:
-            st.warning("chunk_overlap이 chunk_size 이상입니다.")
+
+        loader_tabs = st.tabs(["📕 PDF", "📘 DOCX", "📄 TXT", "📝 MD", "🌐 HTML"])
+        _loader_strategy_per_type: dict[str, str] = {}
+
+        for tab, (ftype, tab_label) in zip(
+            loader_tabs,
+            [("pdf", "PDF"), ("docx", "DOCX"), ("txt", "TXT"), ("md", "MD"), ("html", "HTML")],
+        ):
+            with tab:
+                type_strategies = LOADER_STRATEGIES.get(ftype, ["fulltext"])
+                type_info = LOADER_STRATEGY_INFO.get(ftype, {})
+                sel = _strategy_selector_with_info(
+                    label=f"{tab_label} Loader 전략",
+                    options=type_strategies,
+                    info_dict=type_info,
+                    session_key=f"ing_loader_{ftype}",
+                    default_idx=0,
+                )
+                _loader_strategy_per_type[ftype] = sel
+
+        # Determine effective loader_strategy from uploaded file type (or use pdf default)
+        # Stored as a JSON map in session_state; read by _build_ingestion_config
+        st.session_state["ing_loader_strategy_map"] = _loader_strategy_per_type
+
+        # Use the most common or default for the config key
+        # (index_ingestor dispatches by file_type; we pass the per-type map via metadata)
+        # For now, store the PDF strategy as default (it drives the config field)
+        st.session_state["ing_loader_strategy"] = _loader_strategy_per_type.get("pdf", "page")
 
         st.divider()
 
-        # Batch + Duplicate
+        # ── Splitter strategy ─────────────────────────────────────────
+        st.markdown("**✂️ Splitter (Chunking) 전략**")
+        st.caption(
+            "텍스트 분할 방식을 선택하세요. "
+            "ℹ️ 버튼으로 각 전략의 상세 설명을 확인할 수 있습니다."
+        )
+
+        splitter_strategy = _strategy_selector_with_info(
+            label="Splitter 전략",
+            options=SPLITTER_STRATEGIES,
+            info_dict=SPLITTER_STRATEGY_INFO,
+            session_key="ing_splitter_strategy",
+            default_idx=0,
+        )
+
+        # Show relevant params per strategy
+        if splitter_strategy in ("sliding_window", "recursive"):
+            ck1, ck2 = st.columns(2)
+            ck1.slider(
+                "Chunk Size (tokens)",
+                min_value=100, max_value=2000, value=650, step=50,
+                key="ing_chunk_size",
+                help="1 token ≈ 2자 (한영 혼합 기준)",
+            )
+            ck2.slider(
+                "Chunk Overlap (tokens)",
+                min_value=0, max_value=500, value=100, step=25,
+                key="ing_chunk_overlap",
+            )
+            cs = st.session_state.get("ing_chunk_size", 650)
+            co = st.session_state.get("ing_chunk_overlap", 100)
+            if co >= cs:
+                st.warning("chunk_overlap이 chunk_size 이상입니다.")
+
+        elif splitter_strategy == "sentence":
+            sc1, sc2 = st.columns(2)
+            sc1.number_input(
+                "Sentences per Chunk",
+                min_value=1, max_value=30, value=5,
+                key="ing_sentence_count",
+                help="청크당 포함할 문장 수",
+            )
+            sc2.number_input(
+                "Sentence Overlap",
+                min_value=0, max_value=10, value=1,
+                key="ing_sentence_overlap",
+                help="이전 청크와 공유할 문장 수",
+            )
+
+        elif splitter_strategy == "semantic":
+            sem1, sem2 = st.columns(2)
+            sem1.slider(
+                "Semantic Threshold",
+                min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+                key="ing_semantic_threshold",
+                help="코사인 유사도가 이 값 이하로 떨어지면 청크 경계로 판단 (낮을수록 덜 분할)",
+            )
+            sem2.number_input(
+                "Window Size",
+                min_value=1, max_value=10, value=3,
+                key="ing_semantic_window",
+                help="유사도 비교 시 앞뒤로 포함할 문장 수",
+            )
+            st.info(
+                "🧠 Semantic Split은 임베딩 API를 추가로 호출합니다. "
+                "처리 시간이 늘어나고 비용이 발생할 수 있습니다."
+            )
+
+        st.divider()
+
+        # ── Post-processing ───────────────────────────────────────────
+        st.markdown("**🔧 청크 후처리**")
+        pp1, pp2 = st.columns(2)
+        pp1.checkbox(
+            "섹션 제목 prefix 추가",
+            value=False,
+            key="ing_prepend_title",
+            help="각 청크 앞에 '[섹션명] 본문…' 형태로 섹션 제목을 추가합니다. 검색 정확도 향상에 도움.",
+        )
+        pp2.number_input(
+            "최소 청크 길이 (chars)",
+            min_value=0, max_value=500, value=50,
+            key="ing_min_chunk_len",
+            help="이 길이보다 짧은 청크는 제거합니다.",
+        )
+
+        st.divider()
+
+        # ── Batch + Duplicate ─────────────────────────────────────────
         st.markdown("**⚡ Batch / 중복 처리**")
         bd1, bd2 = st.columns(2)
-        batch_size = bd1.number_input(
+        bd1.number_input(
             "Batch Size",
-            min_value=1,
-            max_value=256,
-            value=32,
+            min_value=1, max_value=256, value=32,
             key="ing_batch_size",
         )
-        dup_policy = bd2.selectbox(
+        bd2.selectbox(
             "Duplicate Policy",
             ["skip", "overwrite"],
             key="ing_dup_policy",
@@ -721,7 +929,7 @@ def render_upload_tab() -> None:
 
         st.divider()
 
-        # Extra metadata
+        # ── Extra metadata ────────────────────────────────────────────
         st.markdown("**🏷 추가 메타데이터 (선택)**")
         metadata_json = st.text_area(
             "Metadata JSON",
@@ -737,7 +945,7 @@ def render_upload_tab() -> None:
 
         st.divider()
 
-        # Debug options
+        # ── Debug options ─────────────────────────────────────────────
         st.markdown("**🐛 Debug 옵션**")
         d1, d2, d3 = st.columns(3)
         show_config = d1.checkbox("Config 출력", key="ing_debug_config")
@@ -775,29 +983,48 @@ def render_upload_tab() -> None:
         if st.button("🔬 첫 번째 파일 청크/벡터 미리보기", key="debug_preview_btn"):
             uf = uploaded_files[0]
             try:
-                from ingestion.chunker import TextChunker
-                from ingestion.loaders import get_loader
-                from ingestion.pdf_loader import _sections_to_raw_doc
                 from pathlib import Path
 
+                from ingestion.chunker import get_chunker
+                from ingestion.loaders import get_loader
+                from ingestion.pdf_loader import _sections_to_raw_doc
+
                 ft = Path(uf.name).suffix.lstrip(".").lower()
-                loader = get_loader(ft)
+                loader_strat = st.session_state.get(
+                    f"ing_loader_{ft}", config.get("loader_strategy")
+                )
+                loader = get_loader(ft, strategy=loader_strat)
                 sections = loader.load_bytes(uf.getvalue(), uf.name)
                 raw_doc = _sections_to_raw_doc(sections, uf.name, ft)
-                chunker = TextChunker(
-                    chunk_size_tokens=config["chunk_size"],
-                    chunk_overlap_tokens=config["chunk_overlap"],
+
+                chunker = get_chunker(
+                    strategy=config.get("splitter_strategy", "sliding_window"),
+                    chunk_size_tokens=config.get("chunk_size", 650),
+                    chunk_overlap_tokens=config.get("chunk_overlap", 100),
+                    sentence_count=config.get("sentence_count", 5),
+                    sentence_overlap=config.get("sentence_overlap", 1),
+                    semantic_threshold=config.get("semantic_threshold", 0.5),
                 )
                 chunks = chunker.chunk_document(raw_doc)
 
-                if show_chunks:
-                    st.markdown(f"**총 {len(chunks)}개 청크**")
-                    for i, c in enumerate(chunks[:5]):
-                        with st.expander(f"Chunk #{i} — {len(c.text)}chars"):
-                            st.text(c.text[:500])
-                            st.json(c.metadata)
+                st.markdown(
+                    f"**🗂 Loader:** `{loader_strat}` &nbsp;|&nbsp; "
+                    f"**✂️ Splitter:** `{config.get('splitter_strategy')}` &nbsp;|&nbsp; "
+                    f"**총 {len(chunks)}개 청크**"
+                )
 
-                if show_vectors:
+                if show_chunks:
+                    for i, c in enumerate(chunks[:5]):
+                        with st.expander(
+                            f"Chunk #{i} — {len(c.text)}chars  |  "
+                            f"section: {c.metadata.get('section', '?')}"
+                        ):
+                            st.text(c.text[:600])
+                            st.json(c.metadata)
+                    if len(chunks) > 5:
+                        st.caption(f"… 나머지 {len(chunks) - 5}개 청크는 생략됩니다.")
+
+                if show_vectors and chunks:
                     from embedder.embedding_router import embed_passages
                     sample_vecs = embed_passages([chunks[0].text], config)
                     st.info(

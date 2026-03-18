@@ -51,7 +51,8 @@ from typing import Any
 
 from config import load_config
 from embedder.upstage_embedder import UpstageEmbedder
-from ingestion.chunker import Chunk, TextChunker
+from ingestion.chunker import Chunk, TextChunker, get_chunker
+from ingestion.strategy_info import DEFAULT_LOADER_STRATEGY
 from ingestion.doc_registry import make_doc_id
 from ingestion.index_registry import DocEntry, IndexRegistry
 from ingestion.ingestion_config import (
@@ -187,7 +188,15 @@ class IndexIngestor:
             self._registry.create(index_name)
 
         file_type = Path(filename).suffix.lstrip(".").lower()
-        loader = get_loader(file_type)
+        # Per-file-type strategy map takes priority over the single loader_strategy field
+        loader_strategy_map: dict = config.get("metadata", {}).get("_loader_strategy_map", {})
+        loader_strategy = (
+            loader_strategy_map.get(file_type)
+            or config.get("loader_strategy")
+            or DEFAULT_LOADER_STRATEGY.get(file_type)
+        )
+        print(f"[IndexIngestor] loader_strategy='{loader_strategy}' for '{file_type}'")
+        loader = get_loader(file_type, strategy=loader_strategy)
         doc_id = make_doc_id(filename)
 
         # ── Duplicate check / overwrite ───────────────────────────────
@@ -210,9 +219,22 @@ class IndexIngestor:
         )
 
         # ── Chunk ─────────────────────────────────────────────────────
-        chunker = TextChunker(
-            chunk_size_tokens=config["chunk_size"],
-            chunk_overlap_tokens=config["chunk_overlap"],
+        splitter_strategy = config.get("splitter_strategy", "sliding_window")
+
+        # semantic chunker needs an embed_fn
+        _embed_fn = None
+        if splitter_strategy == "semantic":
+            def _embed_fn(texts: list[str]) -> list[list[float]]:
+                return self._embed_texts(texts, config)
+
+        chunker = get_chunker(
+            strategy=splitter_strategy,
+            chunk_size_tokens=config.get("chunk_size", 650),
+            chunk_overlap_tokens=config.get("chunk_overlap", 100),
+            sentence_count=config.get("sentence_count", 5),
+            sentence_overlap=config.get("sentence_overlap", 1),
+            semantic_threshold=config.get("semantic_threshold", 0.5),
+            embed_fn=_embed_fn,
         )
         chunks = chunker.chunk_document(raw_doc)
         if not chunks:
@@ -231,6 +253,25 @@ class IndexIngestor:
                     "embedding_model": config["embedding_model"],
                     **extra_meta,
                 }
+            )
+
+        # ── Post-processing ───────────────────────────────────────────
+        # Prepend section title
+        if config.get("prepend_section_title", False):
+            for chunk in chunks:
+                section_label = chunk.metadata.get("section", "")
+                if section_label and section_label not in ("?", "fulltext"):
+                    chunk.text = f"[{section_label}] {chunk.text}"
+
+        # Filter short chunks
+        min_len = config.get("min_chunk_length", 0)
+        if min_len > 0:
+            chunks = [c for c in chunks if len(c.text) >= min_len]
+
+        if not chunks:
+            raise ValueError(
+                f"Post-processing 후 청크가 없습니다. "
+                f"min_chunk_length={min_len}를 낮추거나 전략을 변경하세요."
             )
 
         avg_chunk_len = sum(len(c.text) for c in chunks) / len(chunks)
@@ -448,6 +489,19 @@ class IndexIngestor:
             vectors = embed_passages(texts, config)
 
         return vectors
+
+    def _embed_texts(self, chunks_or_texts, config: IngestionConfig) -> list[list[float]]:
+        """Alias that accepts either chunks or plain text strings."""
+        if chunks_or_texts and isinstance(chunks_or_texts[0], str):
+            texts = chunks_or_texts
+        else:
+            texts = [c.text for c in chunks_or_texts]
+        model = config["embedding_model"]
+        if model == "upstage":
+            self._embedder._batch_size = config["batch_size"]
+            return self._embedder.embed_passages(texts)
+        from embedder.embedding_router import embed_passages
+        return embed_passages(texts, config)
 
     # ------------------------------------------------------------------
     # Private — store helpers

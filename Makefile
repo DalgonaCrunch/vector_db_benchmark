@@ -5,8 +5,11 @@ install:
 	uv sync
 
 # Download and start OpenSearch in background (no Docker required)
+# start-opensearch:
+# 	bash scripts/start_opensearch.sh --daemon
+# data 경로 이슈로 수정
 start-opensearch:
-	bash scripts/start_opensearch.sh --daemon
+	OPENSEARCH_DATA_DIR=$(PWD)/.opensearch/data bash scripts/start_opensearch.sh --daemon
 
 # Stop the background OpenSearch process
 stop-opensearch:

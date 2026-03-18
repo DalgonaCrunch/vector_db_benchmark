@@ -6,20 +6,21 @@ Architecture:
     └─ Document A (pdf), Document B (docx), …  → shared vector space
 
 Tabs:
-  📤 문서 추가   — 선택된 Index에 PDF/DOCX 업로드
+  📤 문서 추가   — 선택된 Index에 PDF/DOCX 업로드 (full ingestion config)
   🔍 검색        — 선택된 Index에서 Qdrant vs OpenSearch 비교
   ⚖️ Index 비교  — 두 Index를 동일 쿼리로 비교
   🗂 관리        — Index 목록 · 문서 목록 · 삭제
 
 Sidebar:
-  • 기존 Index 드롭다운 선택
-  • 새 Index 생성
+  • 기존 Index 드롭다운 선택 (변경 시 관련 상태 자동 초기화)
+  • 새 Index 생성 (dimension / distance metric / OS shards+replicas 설정 포함)
 
 Run:
     make start-opensearch && make app
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,12 @@ from config import load_config
 from embedder.upstage_embedder import UpstageEmbedder
 from ingestion.index_ingestor import IndexIngestor, IngestResult
 from ingestion.index_registry import IndexRegistry, KBIndex, sanitize_index_name
+from ingestion.ingestion_config import (
+    DISTANCE_TO_SPACE_TYPE,
+    MODEL_DIMENSIONS,
+    IngestionConfig,
+    validate_ingestion_config,
+)
 from ingestion.loaders import FILE_LOADER_REGISTRY
 from stores.base_store import SearchResult
 from stores.opensearch_store import OpenSearchStoreConfig, OpenSearchVectorStore
@@ -49,6 +56,15 @@ _REGISTRY_PATH = "./data/index_registry.json"
 _FILE_TYPE_ICON: dict[str, str] = {"pdf": "📕", "docx": "📘"}
 _PREVIEW_LEN = 300
 
+# ---------------------------------------------------------------------------
+# Session state keys that must be reset when the active index changes
+# ---------------------------------------------------------------------------
+_INDEX_BOUND_KEYS = [
+    "upload_batch_result",
+    "search_outcomes",
+    "search_query",
+    "doc_uploader",
+]
 
 # ---------------------------------------------------------------------------
 # Cached heavy resources
@@ -68,7 +84,7 @@ def _load_embedder() -> UpstageEmbedder:
 
 
 # ---------------------------------------------------------------------------
-# Lightweight helpers (cheap to recreate — not cached)
+# Lightweight helpers
 # ---------------------------------------------------------------------------
 
 
@@ -81,7 +97,6 @@ def _load_ingestor() -> IndexIngestor:
 
 
 def _make_qdrant(index_name: str) -> QdrantVectorStore:
-    """Connect to an existing Qdrant collection (no initialize())."""
     cfg = load_config()
     return QdrantVectorStore(
         QdrantStoreConfig(
@@ -95,7 +110,6 @@ def _make_qdrant(index_name: str) -> QdrantVectorStore:
 
 
 def _make_opensearch(index_name: str) -> OpenSearchVectorStore:
-    """Connect to an existing OpenSearch index (no initialize())."""
     cfg = load_config()
     return OpenSearchVectorStore(
         OpenSearchStoreConfig(
@@ -115,11 +129,14 @@ def _make_opensearch(index_name: str) -> OpenSearchVectorStore:
 
 
 def _active_index() -> str | None:
-    """Return the currently selected index name from session state."""
     return st.session_state.get("active_index_name")
 
 
 def _set_active_index(name: str) -> None:
+    prev = st.session_state.get("active_index_name")
+    if prev != name:
+        for key in _INDEX_BOUND_KEYS:
+            st.session_state.pop(key, None)
     st.session_state["active_index_name"] = name
 
 
@@ -156,7 +173,6 @@ def run_search(
     use_opensearch: bool,
     filter_doc_id: str | None = None,
 ) -> dict[str, SearchOutcome]:
-    """Embed *query* and search within the given KB index."""
     embedder = _load_embedder()
     try:
         query_vector = embedder.embed_single_query(query)
@@ -214,7 +230,6 @@ def _file_icon(filename: str) -> str:
 
 
 def _highlight(text: str, query: str) -> str:
-    """Bold-wrap query tokens in *text* for markdown rendering."""
     tokens = [re.escape(w) for w in re.split(r"\s+", query.strip()) if len(w) > 1]
     if not tokens:
         return text
@@ -231,7 +246,6 @@ def render_result_card(result: SearchResult, common_ids: set[str]) -> None:
 
     full_text = result.text
     is_long = len(full_text) > _PREVIEW_LEN
-    # pick up the active search query for keyword highlighting (both tabs)
     query = st.session_state.get("search_query", "") or st.session_state.get("cmp_query", "")
 
     with st.container(border=True):
@@ -243,7 +257,6 @@ def render_result_card(result: SearchResult, common_ids: set[str]) -> None:
                 f"**`{result.id}`** &nbsp;|&nbsp; score: {score_html}",
                 unsafe_allow_html=True,
             )
-            # ── Metadata row ──────────────────────────────────────────────
             m_cols = st.columns(4)
             file_icon = _FILE_TYPE_ICON.get(meta.get("file_type", ""), "📄")
             if "source_file" in meta:
@@ -254,14 +267,12 @@ def render_result_card(result: SearchResult, common_ids: set[str]) -> None:
                 m_cols[2].caption(f"🔢 chunk #{meta['chunk_index']}")
             if "file_type" in meta:
                 m_cols[3].caption(f"🗂 {meta['file_type'].upper()}")
-            # ── Preview (300 chars) ───────────────────────────────────────
             preview = full_text[:_PREVIEW_LEN]
             suffix = "…" if is_long else ""
             if query:
                 st.markdown(_highlight(preview, query) + suffix)
             else:
                 st.text(preview + suffix)
-            # ── Full text expander (st.code has built-in copy button) ─────
             if is_long:
                 with st.expander("전체보기"):
                     st.code(full_text, language=None)
@@ -299,14 +310,14 @@ def render_comparison_panel(
     title: str = "📊 비교 메트릭",
 ) -> None:
     qd = outcomes.get("qdrant")
-    os = outcomes.get("opensearch")
-    if not qd or not os or qd.error or os.error:
+    os_out = outcomes.get("opensearch")
+    if not qd or not os_out or qd.error or os_out.error:
         return
 
     qd_ids = [r.id for r in qd.results]
-    os_ids = [r.id for r in os.results]
+    os_ids = [r.id for r in os_out.results]
     jaccard = _jaccard(qd_ids, os_ids)
-    latency_diff = os.latency_ms - qd.latency_ms
+    latency_diff = os_out.latency_ms - qd.latency_ms
     common = set(qd_ids) & set(os_ids)
 
     avg_rank_diff: float | None = None
@@ -326,10 +337,10 @@ def render_comparison_panel(
         delta_color="inverse",
     )
     m3.metric("공통 결과", f"{len(common)} / {max(len(qd_ids), len(os_ids))}")
-    if avg_rank_diff is not None:
-        m4.metric("Avg 순위 차이", f"{avg_rank_diff:.2f}")
-    else:
-        m4.metric("Avg 순위 차이", "N/A")
+    m4.metric(
+        "Avg 순위 차이",
+        f"{avg_rank_diff:.2f}" if avg_rank_diff is not None else "N/A",
+    )
 
     only_qd = set(qd_ids) - set(os_ids)
     only_os = set(os_ids) - set(qd_ids)
@@ -345,12 +356,11 @@ def render_comparison_panel(
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: Index selector + creation
+# Sidebar: Index selector + advanced creation
 # ---------------------------------------------------------------------------
 
 
 def render_sidebar() -> None:
-    """Render the KB Index selector in the sidebar."""
     with st.sidebar:
         st.header("📚 Knowledge Base")
 
@@ -379,21 +389,59 @@ def render_sidebar() -> None:
             if kb:
                 st.metric("총 청크", f"{kb.total_chunks():,}개")
                 st.caption(
-                    f"문서 {len(kb.documents)}개 · "
-                    f"dim {kb.vector_dim or '?'}"
+                    f"문서 {len(kb.documents)}개 · dim {kb.vector_dim or '?'}"
                 )
         else:
             st.info("Index가 없습니다.\n아래에서 새로 생성하세요.")
 
         st.divider()
 
-        # ── Create new index ─────────────────────────────────────────────
+        # ── Create new index (advanced) ───────────────────────────────────
         st.subheader("➕ 새 Index 생성")
+
         raw_name = st.text_input(
             "Index 이름",
             key="new_index_name_input",
             placeholder="예: medical_kb, project_docs",
         )
+
+        with st.expander("⚙️ Index 상세 옵션", expanded=False):
+            idx_dim = st.number_input(
+                "Embedding Dimension",
+                min_value=64,
+                max_value=8192,
+                value=4096,
+                step=64,
+                key="new_idx_dim",
+                help="Upstage=4096, OpenAI=1536, BGE/E5=1024",
+            )
+            idx_metric = st.selectbox(
+                "Distance Metric",
+                ["cosine", "dot", "euclidean"],
+                key="new_idx_metric",
+                help="코사인 유사도(권장) | 내적 | 유클리드 거리",
+            )
+
+            st.caption("🟧 OpenSearch 전용")
+            idx_os_field = st.text_input(
+                "Vector Field Name",
+                value="vector",
+                key="new_idx_os_field",
+            )
+            idx_os_analyzer = st.selectbox(
+                "Text Analyzer",
+                ["standard", "keyword"],
+                key="new_idx_os_analyzer",
+                help="standard: 형태소 분리 | keyword: 원문 그대로",
+            )
+            c_sh, c_rp = st.columns(2)
+            idx_os_shards = c_sh.number_input(
+                "Shards", min_value=1, max_value=10, value=1, key="new_idx_os_shards"
+            )
+            idx_os_replicas = c_rp.number_input(
+                "Replicas", min_value=0, max_value=5, value=1, key="new_idx_os_replicas"
+            )
+
         if st.button("생성", key="create_index_btn", type="primary"):
             if not raw_name.strip():
                 st.warning("이름을 입력하세요.")
@@ -405,12 +453,26 @@ def render_sidebar() -> None:
                 else:
                     reg.create(sanitized)
                     _set_active_index(sanitized)
-                    st.success(f"Index **'{sanitized}'** 생성됨")
+                    space_type = DISTANCE_TO_SPACE_TYPE.get(idx_metric, "cosinesimil")
+                    st.success(
+                        f"Index **'{sanitized}'** 생성됨  \n"
+                        f"dim={idx_dim} · metric={idx_metric} · "
+                        f"space={space_type}  \n"
+                        f"shards={idx_os_shards} · replicas={idx_os_replicas}"
+                    )
+                    # Stash advanced params in session_state for the ingestor to use
+                    st.session_state[f"idx_cfg_{sanitized}"] = {
+                        "dimension": idx_dim,
+                        "distance_metric": idx_metric,
+                        "os_vector_field": idx_os_field,
+                        "os_analyzer": idx_os_analyzer,
+                        "os_shards": idx_os_shards,
+                        "os_replicas": idx_os_replicas,
+                    }
                     st.rerun()
+
             if raw_name and raw_name != sanitize_index_name(raw_name):
-                st.caption(
-                    f"사용될 이름: **`{sanitize_index_name(raw_name)}`**"
-                )
+                st.caption(f"사용될 이름: **`{sanitize_index_name(raw_name)}`**")
 
         st.divider()
         st.caption("실행 순서")
@@ -418,7 +480,7 @@ def render_sidebar() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tab: Upload
+# Tab: Upload (full IngestionConfig)
 # ---------------------------------------------------------------------------
 
 _BATCH_RESULT_KEY = "upload_batch_result"
@@ -428,31 +490,57 @@ _BATCH_RESULT_KEY = "upload_batch_result"
 class _BatchResult:
     total: int
     successes: list = field(default_factory=list)   # list[tuple[str, IngestResult]]
-    duplicates: list = field(default_factory=list)  # list[str]
+    skipped: list = field(default_factory=list)     # list[str]  (duplicates or policy=skip)
     failures: list = field(default_factory=list)    # list[tuple[str, str]]
     elapsed_s: float = 0.0
+    config: dict = field(default_factory=dict)      # snapshot of IngestionConfig
 
 
-def _run_batch_ingest(uploaded_files: list, active: str) -> _BatchResult:
-    """Duplicate-check then sequentially ingest all new files."""
+def _build_ingestion_config() -> IngestionConfig:
+    """Read all ingestion widgets from session_state and build an IngestionConfig."""
+    dbs: list[str] = st.session_state.get("ing_dbs", ["qdrant", "opensearch"])
+    emb_model: str = st.session_state.get("ing_emb_model", "upstage")
+
+    return IngestionConfig(
+        dbs=dbs,
+        embedding_model=emb_model,
+        embedding_dimension=int(st.session_state.get("ing_emb_dim", MODEL_DIMENSIONS.get(emb_model, 4096))),
+        normalize=bool(st.session_state.get("ing_normalize", False)),
+        chunk_size=int(st.session_state.get("ing_chunk_size", 650)),
+        chunk_overlap=int(st.session_state.get("ing_chunk_overlap", 100)),
+        batch_size=int(st.session_state.get("ing_batch_size", 32)),
+        duplicate_policy=st.session_state.get("ing_dup_policy", "skip"),
+        metadata=json.loads(st.session_state.get("ing_metadata_json", "{}") or "{}"),
+    )
+
+
+def _run_batch_ingest(
+    uploaded_files: list,
+    active: str,
+    config: IngestionConfig,
+    debug: bool,
+) -> _BatchResult:
     ingestor = _load_ingestor()
-    br = _BatchResult(total=len(uploaded_files))
+    br = _BatchResult(total=len(uploaded_files), config=dict(config))
 
-    # ── Duplicate pre-check ───────────────────────────────────────────────
-    dup_status_text = st.empty()
-    dup_status_text.text("중복 파일 확인 중…")
+    # ── Duplicate pre-check (only when policy == skip) ────────────────
     dup_flags: dict[str, bool] = {}
-    for uf in uploaded_files:
-        try:
-            dup_flags[uf.name] = ingestor.is_duplicate(uf.name, active)
-        except Exception:
-            dup_flags[uf.name] = False
-    dup_status_text.empty()
+    if config["duplicate_policy"] == "skip":
+        dup_text = st.empty()
+        dup_text.text("중복 파일 확인 중…")
+        for uf in uploaded_files:
+            try:
+                dup_flags[uf.name] = ingestor._is_duplicate_in_any_db(
+                    uf.name, active, config["dbs"]
+                )
+            except Exception:
+                dup_flags[uf.name] = False
+        dup_text.empty()
 
-    new_files = [uf for uf in uploaded_files if not dup_flags[uf.name]]
-    br.duplicates = [uf.name for uf in uploaded_files if dup_flags[uf.name]]
+    new_files = [uf for uf in uploaded_files if not dup_flags.get(uf.name, False)]
+    br.skipped = [uf.name for uf in uploaded_files if dup_flags.get(uf.name, False)]
 
-    # ── Sequential ingest ─────────────────────────────────────────────────
+    # ── Sequential ingest ─────────────────────────────────────────────
     t_start = time.perf_counter()
     if new_files:
         progress = st.progress(0.0, text="인제스트 준비 중…")
@@ -462,7 +550,9 @@ def _run_batch_ingest(uploaded_files: list, active: str) -> _BatchResult:
                 text=f"처리 중 ({i + 1}/{len(new_files)}): {uf.name}",
             )
             try:
-                res = ingestor.ingest(uf.getvalue(), uf.name, active)
+                res = ingestor.ingest_with_config(
+                    uf.getvalue(), uf.name, active, config
+                )
                 br.successes.append((uf.name, res))
             except Exception as exc:
                 br.failures.append((uf.name, str(exc)))
@@ -474,26 +564,39 @@ def _run_batch_ingest(uploaded_files: list, active: str) -> _BatchResult:
 
 def _render_batch_result(br: _BatchResult) -> None:
     st.subheader("📊 인제스트 결과")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("총 선택 파일", f"{br.total}개")
     c2.metric("신규 인제스트", f"{len(br.successes)}개")
-    c3.metric("중복으로 건너뜀", f"{len(br.duplicates)}개")
+    c3.metric("건너뜀/중복", f"{len(br.skipped)}개")
     c4.metric("총 처리 시간", f"{br.elapsed_s:.1f}s")
 
     if br.successes:
-        st.success(f"✅ 신규 인제스트 완료 — {len(br.successes)}개 파일")
+        st.success(f"✅ 인제스트 완료 — {len(br.successes)}개 파일")
         for filename, res in br.successes:
-            with st.expander(f"{_file_icon(filename)} {filename} — {res.chunk_count}청크"):
-                cc1, cc2, cc3, cc4 = st.columns(4)
-                cc1.metric("청크 수", f"{res.chunk_count}개")
-                cc2.metric("파일 타입", res.file_type.upper())
-                cc3.metric("총 텍스트", f"{res.total_text_length:,}")
-                cc4.metric("평균 청크", f"{res.avg_chunk_length:.0f}")
-                st.caption(f"doc_id: `{res.doc_id}` · dim: {res.vector_dim}")
+            stored_label = " · ".join(
+                f"{'🟦 Qdrant' if db == 'qdrant' else '🟧 OpenSearch'}"
+                for db in res.stored_in
+            )
+            with st.expander(
+                f"{_file_icon(filename)} {filename} — {res.chunk_count}청크"
+            ):
+                r1, r2, r3, r4, r5 = st.columns(5)
+                r1.metric("청크 수", f"{res.chunk_count}개")
+                r2.metric("Embedding Dim", str(res.vector_dim))
+                r3.metric("파일 타입", res.file_type.upper())
+                r4.metric("총 텍스트", f"{res.total_text_length:,}")
+                r5.metric("처리 시간", f"{res.elapsed_s:.2f}s")
 
-    if br.duplicates:
-        st.warning(f"⚠️ 중복으로 건너뜀 — {len(br.duplicates)}개 파일")
-        for fname in br.duplicates:
+                st.caption(
+                    f"📌 저장된 DB: {stored_label}  |  "
+                    f"모델: `{res.embedding_model}`  |  "
+                    f"doc_id: `{res.doc_id}`"
+                )
+
+    if br.skipped:
+        st.warning(f"⚠️ 중복으로 건너뜀 — {len(br.skipped)}개 파일")
+        for fname in br.skipped:
             st.markdown(f"- {_file_icon(fname)} `{fname}`")
 
     if br.failures:
@@ -520,16 +623,137 @@ def render_upload_tab() -> None:
     try:
         qd = _make_qdrant(active)
         if qd.exists():
-            st.info(f"현재 Index 내 벡터: **{qd.count():,}개**")
+            st.info(f"현재 Qdrant 벡터: **{qd.count():,}개**")
     except Exception:
         pass
 
-    # ── Previous batch result (persists across rerun) ─────────────────────
+    # ── Previous batch result ─────────────────────────────────────────
     if _BATCH_RESULT_KEY in st.session_state:
         _render_batch_result(st.session_state[_BATCH_RESULT_KEY])
         st.divider()
 
-    # ── File uploader ─────────────────────────────────────────────────────
+    # ── Ingestion options ─────────────────────────────────────────────
+    with st.expander("⚙️ Ingestion 옵션", expanded=True):
+
+        # DB selection
+        st.markdown("**💾 저장 DB 선택**")
+        dbs = st.multiselect(
+            "저장 대상 DB",
+            ["qdrant", "opensearch"],
+            default=["qdrant", "opensearch"],
+            key="ing_dbs",
+            help="선택한 DB에만 저장합니다.",
+        )
+
+        st.divider()
+
+        # Embedding model
+        st.markdown("**🧠 Embedding 모델**")
+        ec1, ec2 = st.columns([2, 1])
+        emb_model = ec1.selectbox(
+            "Embedding Model",
+            ["upstage", "openai", "bge", "e5"],
+            key="ing_emb_model",
+            help=(
+                "upstage: Solar 4096-dim | "
+                "openai: text-embedding-3-small 1536-dim | "
+                "bge/e5: sentence-transformers 1024-dim (로컬 GPU)"
+            ),
+        )
+        default_dim = MODEL_DIMENSIONS.get(emb_model, 1024)
+        emb_dim = ec2.number_input(
+            "Embedding Dimension",
+            min_value=64,
+            max_value=8192,
+            value=default_dim,
+            step=64,
+            key="ing_emb_dim",
+        )
+        normalize = st.checkbox(
+            "L2 Normalize",
+            value=False,
+            key="ing_normalize",
+            help="벡터를 단위 구면에 사영합니다. dot product = cosine similarity",
+        )
+
+        st.divider()
+
+        # Chunk options
+        st.markdown("**✂️ Chunk 옵션**")
+        ck1, ck2 = st.columns(2)
+        chunk_size = ck1.slider(
+            "Chunk Size (tokens)",
+            min_value=100,
+            max_value=2000,
+            value=650,
+            step=50,
+            key="ing_chunk_size",
+        )
+        chunk_overlap = ck2.slider(
+            "Chunk Overlap (tokens)",
+            min_value=0,
+            max_value=500,
+            value=100,
+            step=25,
+            key="ing_chunk_overlap",
+        )
+        if chunk_overlap >= chunk_size:
+            st.warning("chunk_overlap이 chunk_size 이상입니다.")
+
+        st.divider()
+
+        # Batch + Duplicate
+        st.markdown("**⚡ Batch / 중복 처리**")
+        bd1, bd2 = st.columns(2)
+        batch_size = bd1.number_input(
+            "Batch Size",
+            min_value=1,
+            max_value=256,
+            value=32,
+            key="ing_batch_size",
+        )
+        dup_policy = bd2.selectbox(
+            "Duplicate Policy",
+            ["skip", "overwrite"],
+            key="ing_dup_policy",
+            help="skip: 이미 있으면 건너뜀 | overwrite: 기존 데이터 삭제 후 재저장",
+        )
+
+        st.divider()
+
+        # Extra metadata
+        st.markdown("**🏷 추가 메타데이터 (선택)**")
+        metadata_json = st.text_area(
+            "Metadata JSON",
+            value="{}",
+            height=80,
+            key="ing_metadata_json",
+            placeholder='{"project": "demo", "version": "1.0"}',
+        )
+        try:
+            json.loads(metadata_json or "{}")
+        except json.JSONDecodeError:
+            st.error("올바른 JSON 형식이 아닙니다.")
+
+        st.divider()
+
+        # Debug options
+        st.markdown("**🐛 Debug 옵션**")
+        d1, d2, d3 = st.columns(3)
+        show_config = d1.checkbox("Config 출력", key="ing_debug_config")
+        show_chunks = d2.checkbox("Raw Chunk 출력", key="ing_debug_chunks")
+        show_vectors = d3.checkbox("Vector Shape 출력", key="ing_debug_vectors")
+
+    # ── Config preview / validation ───────────────────────────────────
+    config = _build_ingestion_config()
+    errors = validate_ingestion_config(config)
+    for err in errors:
+        st.warning(err)
+
+    if show_config:
+        st.json(dict(config))
+
+    # ── File uploader ─────────────────────────────────────────────────
     uploaded_files = st.file_uploader(
         "문서를 업로드하세요",
         type=supported,
@@ -540,19 +764,64 @@ def render_upload_tab() -> None:
     if not uploaded_files:
         return
 
-    # ── Selected file list ────────────────────────────────────────────────
     st.markdown(f"**선택된 파일 {len(uploaded_files)}개**")
     for uf in uploaded_files:
-        st.markdown(f"- {_file_icon(uf.name)} **{uf.name}** &nbsp;·&nbsp; {uf.size / 1024:.1f} KB")
+        st.markdown(
+            f"- {_file_icon(uf.name)} **{uf.name}** &nbsp;·&nbsp; {uf.size / 1024:.1f} KB"
+        )
 
-    # ── Batch ingest button ───────────────────────────────────────────────
+    # ── Debug: chunk + vector preview ────────────────────────────────
+    if (show_chunks or show_vectors) and uploaded_files:
+        if st.button("🔬 첫 번째 파일 청크/벡터 미리보기", key="debug_preview_btn"):
+            uf = uploaded_files[0]
+            try:
+                from ingestion.chunker import TextChunker
+                from ingestion.loaders import get_loader
+                from ingestion.pdf_loader import _sections_to_raw_doc
+                from pathlib import Path
+
+                ft = Path(uf.name).suffix.lstrip(".").lower()
+                loader = get_loader(ft)
+                sections = loader.load_bytes(uf.getvalue(), uf.name)
+                raw_doc = _sections_to_raw_doc(sections, uf.name, ft)
+                chunker = TextChunker(
+                    chunk_size_tokens=config["chunk_size"],
+                    chunk_overlap_tokens=config["chunk_overlap"],
+                )
+                chunks = chunker.chunk_document(raw_doc)
+
+                if show_chunks:
+                    st.markdown(f"**총 {len(chunks)}개 청크**")
+                    for i, c in enumerate(chunks[:5]):
+                        with st.expander(f"Chunk #{i} — {len(c.text)}chars"):
+                            st.text(c.text[:500])
+                            st.json(c.metadata)
+
+                if show_vectors:
+                    from embedder.embedding_router import embed_passages
+                    sample_vecs = embed_passages([chunks[0].text], config)
+                    st.info(
+                        f"Vector shape: ({len(sample_vecs)}, {len(sample_vecs[0])})  |  "
+                        f"첫 5개 값: {[round(v, 4) for v in sample_vecs[0][:5]]}"
+                    )
+            except Exception as exc:
+                st.error(f"미리보기 실패: {exc}")
+
+    # ── Batch ingest button ───────────────────────────────────────────
+    ingest_disabled = bool(errors) or not dbs
     if st.button(
         f"📥 선택한 모든 파일 인제스트 ({len(uploaded_files)}개)",
         type="primary",
         key="batch_ingest_btn",
+        disabled=ingest_disabled,
     ):
         st.session_state.pop(_BATCH_RESULT_KEY, None)
-        br = _run_batch_ingest(uploaded_files, active)
+        br = _run_batch_ingest(
+            uploaded_files,
+            active,
+            config,
+            debug=(show_config or show_chunks or show_vectors),
+        )
         st.session_state[_BATCH_RESULT_KEY] = br
         st.rerun()
 
@@ -580,20 +849,17 @@ def render_search_tab() -> None:
             f"dim {kb.vector_dim or '?'}"
         )
 
-    # Query input
     query = st.text_input(
         "질문 입력",
         placeholder="이 Knowledge Base에 대한 질문을 입력하세요",
         key="search_query_input",
     )
 
-    # Controls
     c1, c2, c3 = st.columns([3, 1, 1])
     top_k = c1.slider("Top-K", 1, 20, 5, key="search_top_k")
     use_qdrant = c2.checkbox("🟦 Qdrant", value=True, key="search_use_qdrant")
     use_opensearch = c3.checkbox("🟧 OpenSearch", value=True, key="search_use_os")
 
-    # Document filter within the index
     filter_doc_id: str | None = None
     if kb and kb.documents:
         doc_options = {"전체 문서 검색": None} | {
@@ -720,19 +986,18 @@ def render_compare_tab() -> None:
 
     st.markdown(f"### `{st.session_state.get('cmp_query', '')}`")
 
-    # Cross-index Jaccard
     st.subheader("📊 Index 간 결과 중복도")
-    cross_cols: list[tuple[str, str]] = []
+    cross_cols: list[tuple[str, float]] = []
     for key, label in [("qdrant", "Qdrant"), ("opensearch", "OpenSearch")]:
         oa, ob = out_a.get(key), out_b.get(key)
         if oa and ob and not oa.error and not ob.error:
-            cross_cols.append((label, _jaccard([r.id for r in oa.results],
-                                               [r.id for r in ob.results])))
+            cross_cols.append(
+                (label, _jaccard([r.id for r in oa.results], [r.id for r in ob.results]))
+            )
     if cross_cols:
         cols = st.columns(len(cross_cols))
         for col, (label, j) in zip(cols, cross_cols):
-            col.metric(f"{label}: A∩B Jaccard", f"{j:.3f}",
-                       help="0 = 두 Index에서 완전히 다른 결과")
+            col.metric(f"{label}: A∩B Jaccard", f"{j:.3f}")
     st.divider()
 
     left, right = st.columns(2)
@@ -750,7 +1015,6 @@ def render_compare_tab() -> None:
     with left:
         st.markdown(f"#### 🗄️ Index A: `{la}`")
         _doc_results_col(out_a, la)
-
     with right:
         st.markdown(f"#### 🗄️ Index B: `{lb}`")
         _doc_results_col(out_b, lb)
@@ -786,7 +1050,6 @@ def render_manage_tab() -> None:
                 m3.metric("Dim", str(kb.vector_dim or "?"))
                 st.caption(f"생성: {kb.created_at[:19]}")
 
-                # Live store counts
                 cnt_cols = st.columns(2)
                 with cnt_cols[0]:
                     try:
@@ -795,8 +1058,8 @@ def render_manage_tab() -> None:
                             cnt_cols[0].success(f"🟦 Qdrant: {store.count():,} vectors")
                         else:
                             cnt_cols[0].warning("🟦 Qdrant: 컬렉션 없음")
-                    except Exception as e:
-                        cnt_cols[0].error(f"🟦 Qdrant 연결 실패")
+                    except Exception:
+                        cnt_cols[0].error("🟦 Qdrant 연결 실패")
 
                 with cnt_cols[1]:
                     try:
@@ -805,10 +1068,9 @@ def render_manage_tab() -> None:
                             cnt_cols[1].success(f"🟧 OS: {store.count():,} vectors")
                         else:
                             cnt_cols[1].warning("🟧 OpenSearch: 인덱스 없음")
-                    except Exception as e:
-                        cnt_cols[1].error(f"🟧 OpenSearch 연결 실패")
+                    except Exception:
+                        cnt_cols[1].error("🟧 OpenSearch 연결 실패")
 
-                # Document list
                 if kb.documents:
                     with st.expander(f"📄 문서 목록 ({len(kb.documents)}개)"):
                         for doc in kb.documents:
@@ -848,7 +1110,7 @@ def render_manage_tab() -> None:
 def main() -> None:
     st.title("🗄️ Vector DB Benchmark")
     st.caption(
-        "KB Index 기반 · 문서 다중 누적 저장 · "
+        "KB Index 기반 · 다중 DB / 다중 임베딩 모델 · "
         "**Qdrant** vs **OpenSearch** 실시간 시맨틱 검색"
     )
 

@@ -7,28 +7,57 @@ Unlike the old per-document architecture (one collection per file), here:
   • Multiple documents can be appended into the same index over time.
   • Existing data is never deleted; new chunks are always appended.
 
+Extended API (ingest_with_config):
+  • DB targets are controlled by IngestionConfig["dbs"]
+  • Embedding model is dispatched via embedder.embedding_router
+  • Chunk size / overlap are overridden per-run
+  • duplicate_policy controls skip vs overwrite behaviour
+  • Extra metadata is merged into every chunk's metadata dict
+
 Usage::
 
     registry = IndexRegistry()
     registry.create("my_kb")
 
     ingestor = IndexIngestor(embedder, registry)
+
+    # Legacy: always stores in both Qdrant + OpenSearch, uses UpstageEmbedder
     result = ingestor.ingest(pdf_bytes, "report.pdf", "my_kb")
-    print(result.chunk_count)
+
+    # Extended: full config control
+    from ingestion.ingestion_config import IngestionConfig
+    cfg = IngestionConfig(
+        dbs=["opensearch"],
+        embedding_model="openai",
+        embedding_dimension=1536,
+        normalize=True,
+        chunk_size=512,
+        chunk_overlap=64,
+        batch_size=16,
+        duplicate_policy="overwrite",
+        metadata={"project": "demo"},
+    )
+    result = ingestor.ingest_with_config(pdf_bytes, "report.pdf", "my_kb", cfg)
 
     ingestor.delete_index("my_kb")   # removes both stores + registry entry
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from config import load_config
 from embedder.upstage_embedder import UpstageEmbedder
-from ingestion.chunker import TextChunker
+from ingestion.chunker import Chunk, TextChunker
 from ingestion.doc_registry import make_doc_id
 from ingestion.index_registry import DocEntry, IndexRegistry
+from ingestion.ingestion_config import (
+    DISTANCE_TO_SPACE_TYPE,
+    IngestionConfig,
+)
 from ingestion.loaders import get_loader
 from ingestion.pdf_loader import _sections_to_raw_doc
 from stores.base_store import Document
@@ -48,19 +77,25 @@ class IngestResult:
     vector_dim: int
     total_text_length: int
     avg_chunk_length: float
+    stored_in: list[str]         # which DBs were written to
+    embedding_model: str         # which model was used
+    elapsed_s: float             # wall-clock seconds for the full run
 
     def print_summary(self) -> None:
         sep = "-" * 60
         print(f"\n{sep}")
         print(f"  INGEST → index: '{self.index_name}'")
         print(sep)
-        print(f"  source_file  : {self.source_file}")
-        print(f"  file_type    : {self.file_type}")
-        print(f"  doc_id       : {self.doc_id}")
-        print(f"  chunks       : {self.chunk_count}")
-        print(f"  vector_dim   : {self.vector_dim}")
-        print(f"  total_text   : {self.total_text_length:,} chars")
-        print(f"  avg_chunk    : {self.avg_chunk_length:.0f} chars")
+        print(f"  source_file    : {self.source_file}")
+        print(f"  file_type      : {self.file_type}")
+        print(f"  doc_id         : {self.doc_id}")
+        print(f"  chunks         : {self.chunk_count}")
+        print(f"  vector_dim     : {self.vector_dim}")
+        print(f"  total_text     : {self.total_text_length:,} chars")
+        print(f"  avg_chunk      : {self.avg_chunk_length:.0f} chars")
+        print(f"  embedding      : {self.embedding_model}")
+        print(f"  stored_in      : {', '.join(self.stored_in)}")
+        print(f"  elapsed        : {self.elapsed_s:.2f}s")
         print(sep)
 
 
@@ -69,13 +104,13 @@ class IndexIngestor:
     Appends documents into an existing KB index.
 
     The KB index's Qdrant collection and OpenSearch index are created on the
-    first ``ingest()`` call (lazy initialisation), then reused for subsequent
-    documents.
+    first ``ingest()`` or ``ingest_with_config()`` call (lazy initialisation),
+    then reused for subsequent documents.
 
     Parameters
     ----------
     embedder:
-        Configured UpstageEmbedder.
+        Configured UpstageEmbedder (used by the legacy ``ingest()`` method).
     registry:
         Shared IndexRegistry instance.
     """
@@ -90,20 +125,34 @@ class IndexIngestor:
         )
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — legacy (Upstage only, both DBs always)
     # ------------------------------------------------------------------
 
     def ingest(
         self, file_bytes: bytes, filename: str, index_name: str
     ) -> IngestResult:
         """
-        Load, chunk, embed and append a document to *index_name*.
+        Legacy ingestion: Upstage embedding, both Qdrant + OpenSearch.
 
-        If *index_name* does not yet exist in the registry it is created
-        automatically (useful for CLI / scripted use).
+        Delegates to ``ingest_with_config`` with a default upstage config.
+        """
+        from ingestion.ingestion_config import default_ingestion_config
+        config = default_ingestion_config()
+        return self.ingest_with_config(file_bytes, filename, index_name, config)
 
-        The underlying Qdrant collection and OpenSearch index are created on
-        the first call; subsequent calls append without touching existing data.
+    # ------------------------------------------------------------------
+    # Public API — extended (full config control)
+    # ------------------------------------------------------------------
+
+    def ingest_with_config(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        index_name: str,
+        config: IngestionConfig,
+    ) -> IngestResult:
+        """
+        Load, chunk, embed, and append a document to *index_name*.
 
         Parameters
         ----------
@@ -113,6 +162,14 @@ class IndexIngestor:
             Original filename, used to determine the file type and doc_id.
         index_name:
             Name of the target KB index (must be sanitised before calling).
+            Auto-created if not present in the registry.
+        config:
+            Full IngestionConfig controlling DB targets, embedding model,
+            chunk params, batch size, duplicate policy, and extra metadata.
+
+        Returns
+        -------
+        IngestResult
 
         Raises
         ------
@@ -120,7 +177,11 @@ class IndexIngestor:
             If the file extension is not registered.
         ValueError
             If the document has no extractable text.
+        RuntimeError
+            If embedding or store insertion fails.
         """
+        t_start = time.perf_counter()
+
         # Auto-create index if not present
         if not self._registry.get(index_name):
             self._registry.create(index_name)
@@ -129,7 +190,15 @@ class IndexIngestor:
         loader = get_loader(file_type)
         doc_id = make_doc_id(filename)
 
-        # Load → raw_doc
+        # ── Duplicate check / overwrite ───────────────────────────────
+        if config["duplicate_policy"] == "skip":
+            if self._is_duplicate_in_any_db(filename, index_name, config["dbs"]):
+                raise ValueError(
+                    f"'{filename}' 은(는) '{index_name}'에 이미 존재합니다. "
+                    "(duplicate_policy=skip)"
+                )
+
+        # ── Load → RawDocument ─────────────────────────────────────────
         print(f"[IndexIngestor] Loading '{filename}' → index '{index_name}' …")
         loaded_sections = loader.load_bytes(file_bytes, filename)
         raw_doc = _sections_to_raw_doc(loaded_sections, filename, file_type)
@@ -140,26 +209,48 @@ class IndexIngestor:
             f"{total_text_length:,} chars"
         )
 
-        # Chunk
-        chunks = self._chunker.chunk_document(raw_doc)
+        # ── Chunk ─────────────────────────────────────────────────────
+        chunker = TextChunker(
+            chunk_size_tokens=config["chunk_size"],
+            chunk_overlap_tokens=config["chunk_overlap"],
+        )
+        chunks = chunker.chunk_document(raw_doc)
         if not chunks:
             raise ValueError(f"No chunks produced from '{filename}'.")
 
-        # Enrich metadata
+        # ── Enrich metadata ───────────────────────────────────────────
         now_iso = datetime.now().isoformat()
+        extra_meta: dict[str, Any] = config.get("metadata") or {}
         for chunk in chunks:
-            chunk.metadata["index_name"] = index_name
-            chunk.metadata["doc_id"] = doc_id
-            chunk.metadata["source_file"] = filename
-            chunk.metadata["upload_time"] = now_iso
+            chunk.metadata.update(
+                {
+                    "index_name": index_name,
+                    "doc_id": doc_id,
+                    "source_file": filename,
+                    "upload_time": now_iso,
+                    "embedding_model": config["embedding_model"],
+                    **extra_meta,
+                }
+            )
 
         avg_chunk_len = sum(len(c.text) for c in chunks) / len(chunks)
 
-        # Embed
-        print(f"[IndexIngestor] Embedding {len(chunks)} chunks …")
-        vectors = self._embedder.embed_passages([c.text for c in chunks])
-        vector_dim = self._embedder.dimension
+        # ── Embed ─────────────────────────────────────────────────────
+        print(
+            f"[IndexIngestor] Embedding {len(chunks)} chunks "
+            f"(model={config['embedding_model']}) …"
+        )
+        vectors = self._embed(chunks, config)
+        vector_dim = len(vectors[0]) if vectors else config["embedding_dimension"]
 
+        # Validate actual dimension matches config
+        if vectors and vector_dim != config["embedding_dimension"]:
+            print(
+                f"[IndexIngestor] WARNING: actual dim={vector_dim} "
+                f"≠ config dim={config['embedding_dimension']}"
+            )
+
+        # ── Build Document objects ─────────────────────────────────────
         documents = [
             Document(
                 id=chunk.chunk_id,
@@ -170,12 +261,28 @@ class IndexIngestor:
             for chunk, vec in zip(chunks, vectors)
         ]
 
-        # Get or create stores (lazy init on first doc, append on subsequent)
-        qd_store, os_store = self._get_or_create_stores(index_name, vector_dim)
-        qd_store.insert(documents)
-        os_store.insert(documents)
+        # ── Store in selected DBs ──────────────────────────────────────
+        stored_in: list[str] = []
 
-        # Update registry
+        if "qdrant" in config["dbs"]:
+            self._upsert_qdrant(
+                index_name,
+                vector_dim,
+                documents,
+                overwrite=(config["duplicate_policy"] == "overwrite"),
+            )
+            stored_in.append("qdrant")
+
+        if "opensearch" in config["dbs"]:
+            self._index_opensearch(
+                index_name,
+                vector_dim,
+                documents,
+                overwrite=(config["duplicate_policy"] == "overwrite"),
+            )
+            stored_in.append("opensearch")
+
+        # ── Update registry ────────────────────────────────────────────
         doc_entry = DocEntry(
             doc_id=doc_id,
             source_file=filename,
@@ -184,6 +291,8 @@ class IndexIngestor:
             chunk_count=len(chunks),
         )
         self._registry.add_document(index_name, doc_entry, vector_dim)
+
+        elapsed = time.perf_counter() - t_start
 
         result = IngestResult(
             index_name=index_name,
@@ -194,63 +303,76 @@ class IndexIngestor:
             vector_dim=vector_dim,
             total_text_length=total_text_length,
             avg_chunk_length=avg_chunk_len,
+            stored_in=stored_in,
+            embedding_model=config["embedding_model"],
+            elapsed_s=elapsed,
         )
         result.print_summary()
         return result
 
+    # ------------------------------------------------------------------
+    # Duplicate detection
+    # ------------------------------------------------------------------
+
     def is_duplicate(self, filename: str, index_name: str) -> bool:
-        """Return True if *filename* is already ingested in *index_name*.
+        """Return True if *filename* is already ingested in *index_name*."""
+        return self._is_duplicate_in_any_db(
+            filename, index_name, ["qdrant", "opensearch"]
+        )
 
-        Checks Qdrant first (local/fast), falls back to OpenSearch.
-        Returns False if neither store exists yet.
-        """
+    def _is_duplicate_in_any_db(
+        self, filename: str, index_name: str, dbs: list[str]
+    ) -> bool:
+        """Check only the DBs listed in *dbs*."""
         cfg = self._cfg
-        try:
-            qd_store = QdrantVectorStore(
-                QdrantStoreConfig(
-                    collection_name=index_name,
-                    mode=cfg.qdrant.mode,
-                    local_path=cfg.qdrant.local_path,
-                    host=cfg.qdrant.host,
-                    port=cfg.qdrant.port,
-                )
-            )
-            if qd_store.exists():
-                return qd_store.source_file_exists(filename)
-        except Exception:
-            pass
 
-        try:
-            os_store = OpenSearchVectorStore(
-                OpenSearchStoreConfig(
-                    host=cfg.opensearch.host,
-                    port=cfg.opensearch.port,
-                    index_name=index_name,
-                    engine=cfg.opensearch.engine,
-                    space_type=cfg.opensearch.space_type,
-                    ef_construction=cfg.opensearch.ef_construction,
-                    m=cfg.opensearch.m,
-                    username=cfg.opensearch.username,
-                    password=cfg.opensearch.password,
-                    use_ssl=cfg.opensearch.use_ssl,
-                    verify_certs=cfg.opensearch.verify_certs,
+        if "qdrant" in dbs:
+            try:
+                store = QdrantVectorStore(
+                    QdrantStoreConfig(
+                        collection_name=index_name,
+                        mode=cfg.qdrant.mode,
+                        local_path=cfg.qdrant.local_path,
+                        host=cfg.qdrant.host,
+                        port=cfg.qdrant.port,
+                    )
                 )
-            )
-            if os_store.exists():
-                return os_store.source_file_exists(filename)
-        except Exception:
-            pass
+                if store.exists():
+                    return store.source_file_exists(filename)
+            except Exception:
+                pass
+
+        if "opensearch" in dbs:
+            try:
+                store = OpenSearchVectorStore(
+                    OpenSearchStoreConfig(
+                        host=cfg.opensearch.host,
+                        port=cfg.opensearch.port,
+                        index_name=index_name,
+                        engine=cfg.opensearch.engine,
+                        space_type=cfg.opensearch.space_type,
+                        ef_construction=cfg.opensearch.ef_construction,
+                        m=cfg.opensearch.m,
+                        username=cfg.opensearch.username,
+                        password=cfg.opensearch.password,
+                        use_ssl=cfg.opensearch.use_ssl,
+                        verify_certs=cfg.opensearch.verify_certs,
+                    )
+                )
+                if store.exists():
+                    return store.source_file_exists(filename)
+            except Exception:
+                pass
 
         return False
+
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
 
     def delete_index(self, index_name: str) -> None:
         """
         Delete the Qdrant collection, OpenSearch index, and registry entry.
-
-        Parameters
-        ----------
-        index_name:
-            Must be a registered index name.
 
         Raises
         ------
@@ -307,8 +429,89 @@ class IndexIngestor:
         print(f"[IndexIngestor] Deleted index '{index_name}'.")
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Private — embedding
     # ------------------------------------------------------------------
+
+    def _embed(
+        self, chunks: list[Chunk], config: IngestionConfig
+    ) -> list[list[float]]:
+        """Dispatch to the correct embedding backend."""
+        texts = [c.text for c in chunks]
+        model = config["embedding_model"]
+
+        if model == "upstage":
+            # Use the pre-built UpstageEmbedder (connection pooled)
+            self._embedder._batch_size = config["batch_size"]
+            vectors = self._embedder.embed_passages(texts)
+        else:
+            from embedder.embedding_router import embed_passages
+            vectors = embed_passages(texts, config)
+
+        return vectors
+
+    # ------------------------------------------------------------------
+    # Private — store helpers
+    # ------------------------------------------------------------------
+
+    def _upsert_qdrant(
+        self,
+        index_name: str,
+        vector_dim: int,
+        documents: list[Document],
+        overwrite: bool = False,
+    ) -> None:
+        """Create-or-append into a Qdrant collection."""
+        cfg = self._cfg
+        store = QdrantVectorStore(
+            QdrantStoreConfig(
+                collection_name=index_name,
+                mode=cfg.qdrant.mode,
+                local_path=cfg.qdrant.local_path,
+                host=cfg.qdrant.host,
+                port=cfg.qdrant.port,
+            )
+        )
+        if overwrite and store.exists():
+            store.delete()
+            store.initialize(vector_dim)
+        else:
+            store.initialize_if_not_exists(vector_dim)
+        store.insert(documents)
+        print(f"[IndexIngestor] Qdrant '{index_name}': {store.count()} vectors total.")
+
+    def _index_opensearch(
+        self,
+        index_name: str,
+        vector_dim: int,
+        documents: list[Document],
+        overwrite: bool = False,
+    ) -> None:
+        """Create-or-append into an OpenSearch index."""
+        cfg = self._cfg
+        store = OpenSearchVectorStore(
+            OpenSearchStoreConfig(
+                host=cfg.opensearch.host,
+                port=cfg.opensearch.port,
+                index_name=index_name,
+                engine=cfg.opensearch.engine,
+                space_type=cfg.opensearch.space_type,
+                ef_construction=cfg.opensearch.ef_construction,
+                m=cfg.opensearch.m,
+                username=cfg.opensearch.username,
+                password=cfg.opensearch.password,
+                use_ssl=cfg.opensearch.use_ssl,
+                verify_certs=cfg.opensearch.verify_certs,
+            )
+        )
+        if overwrite and store.exists():
+            store.delete()
+            store.initialize(vector_dim)
+        else:
+            store.initialize_if_not_exists(vector_dim)
+        store.insert(documents)
+        print(
+            f"[IndexIngestor] OpenSearch '{index_name}': {store.count()} vectors total."
+        )
 
     def _get_or_create_stores(
         self, index_name: str, vector_dim: int

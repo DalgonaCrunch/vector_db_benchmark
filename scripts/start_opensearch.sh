@@ -19,6 +19,7 @@ set -euo pipefail
 OS_VERSION="${OPENSEARCH_VERSION:-2.13.0}"
 ARCH="x64"
 INSTALL_DIR="$(pwd)/.opensearch"
+DATA_DIR="$(pwd)/data/opensearch"
 OS_DIR="${INSTALL_DIR}/opensearch-${OS_VERSION}"
 PID_FILE="${INSTALL_DIR}/opensearch.pid"
 TARBALL_URL="https://artifacts.opensearch.org/releases/bundle/opensearch/${OS_VERSION}/opensearch-${OS_VERSION}-linux-${ARCH}.tar.gz"

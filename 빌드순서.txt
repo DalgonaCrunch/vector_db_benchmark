@@ -1,0 +1,15 @@
+# uv 환경 구성
+uv venv
+uv sync
+
+# Qdrant 서비스 실행 (docker 사용x, $PATH 에 등록됨)
+qdrant (./qdrant)
+
+# OpenSearch 서비스 실행 (docker 사용x)
+make start-opensearch
+
+# 챗봇용 Streamlit UI (Benchmark + RAG Chatbot)
+make app
+
+# 벤치마크용 Streamlit UI (Qdrant vs OpenSearch)
+make run

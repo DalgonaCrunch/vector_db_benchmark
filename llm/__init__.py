@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from llm.base_provider import BaseLLMProvider
 from llm.claude_provider import ClaudeProvider
+from llm.company_provider import CompanyProvider, _fetch_company_models
 from llm.gemini_provider import GeminiProvider
 from llm.openai_provider import OpenAIProvider
 from llm.upstage_provider import UpstageProvider
@@ -31,13 +32,18 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "OpenAI": OpenAIProvider.MODELS,
     "Claude": ClaudeProvider.MODELS,
     "Gemini": GeminiProvider.MODELS,
+    # Company server: model list resolved dynamically from /v1/models at runtime.
+    # Shown here with fallback names; actual list is refreshed on provider init.
+    "Company": CompanyProvider.MODELS,
 }
 
-_PROVIDER_ENV: dict[str, str] = {
+# None  → no API key required (Company uses api_key="EMPTY" internally)
+_PROVIDER_ENV: dict[str, str | None] = {
     "Upstage": "UPSTAGE_API_KEY",
     "OpenAI": "OPENAI_API_KEY",
     "Claude": "ANTHROPIC_API_KEY",
     "Gemini": "GEMINI_API_KEY",
+    "Company": None,   # auth-free; optionally override URL via COMPANY_LLM_URL
 }
 
 
@@ -51,11 +57,16 @@ def get_provider(name: str) -> BaseLLMProvider:
     ImportError
         If the underlying SDK package is not installed.
     """
-    env_key = _PROVIDER_ENV.get(name)
-    if env_key is None:
+    if name not in _PROVIDER_ENV:
         raise ValueError(f"Unknown provider '{name}'. Available: {list(PROVIDER_MODELS)}")
 
-    api_key = os.getenv(env_key, "")
+    env_key = _PROVIDER_ENV[name]
+
+    # Company provider requires no API key — connect directly
+    if name == "Company":
+        return CompanyProvider()
+
+    api_key = os.getenv(env_key or "", "")
     if not api_key:
         raise ValueError(
             f"API 키가 설정되지 않았습니다. "
@@ -74,5 +85,12 @@ def get_provider(name: str) -> BaseLLMProvider:
 
 
 def available_providers() -> list[str]:
-    """Return providers whose API key env var is currently set."""
-    return [name for name, env in _PROVIDER_ENV.items() if os.getenv(env)]
+    """Return providers that are ready to use.
+
+    Key-based providers: require the corresponding env var to be set.
+    Company provider  : always available (no key required).
+    """
+    result = [name for name, env in _PROVIDER_ENV.items() if env and os.getenv(env)]
+    if "Company" not in result:
+        result.append("Company")
+    return result

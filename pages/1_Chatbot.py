@@ -204,10 +204,14 @@ def _render_sidebar() -> dict:
         model = st.selectbox("모델", PROVIDER_MODELS[provider], key="cb_model")
 
         env_key = _PROVIDER_ENV[provider]
-        if not os.getenv(env_key):
+        if env_key and not os.getenv(env_key):
             st.warning(
                 f"`{env_key}` 환경변수가 없습니다.\n`.env` 파일에 추가 후 재시작하세요."
             )
+        if provider == "Company":
+            import os as _os
+            _url = _os.getenv("COMPANY_LLM_URL", "http://182.162.73.81:8000/v1")
+            st.caption(f"🏢 사내 서버: `{_url}`")
 
         st.divider()
 

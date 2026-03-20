@@ -51,3 +51,4 @@ benchmark_results.csv
 # Logs
 *.log
 logs/
+LangGraph 활용 분석 (기존프로젝트)

@@ -488,6 +488,8 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 _BATCH_RESULT_KEY = "upload_batch_result"
+_AI_CONFIG_KEY = "ai_config_pending"      # stores ConfigRecommendation before apply
+_AI_CONFIG_RESULT_KEY = "ai_config_result"  # stores last applied recommendation
 
 
 @dataclass
@@ -714,6 +716,122 @@ def _render_batch_result(br: _BatchResult) -> None:
             st.markdown(f"- **{_file_icon(fname)} {fname}**: {err}")
 
 
+def _apply_pending_ai_config() -> None:
+    """
+    If a ConfigRecommendation is waiting in session_state, apply it to all
+    widget keys NOW (before the widgets render) and move it to the result store.
+    Called at the top of render_upload_tab() so widgets pick up the new values.
+    """
+    rec = st.session_state.pop(_AI_CONFIG_KEY, None)
+    if rec is None:
+        return
+    from ingestion.ai_config_advisor import apply_to_session_state
+    apply_to_session_state(rec)
+    st.session_state[_AI_CONFIG_RESULT_KEY] = rec
+
+
+def _render_ai_config_panel() -> None:
+    """
+    Render the '🤖 AI 자동 설정' collapsible panel.
+
+    Flow
+    ----
+    1. User pastes a document description (or sample text) in the text area.
+    2. Clicks '분석 및 자동 설정'.
+    3. GeminiProvider analyzes the text and returns a ConfigRecommendation.
+    4. Recommendation is stored in _AI_CONFIG_KEY and st.rerun() is called.
+    5. On rerun, _apply_pending_ai_config() writes the values to widget keys
+       *before* the expander renders, so sliders/selectboxes show new values.
+    """
+    with st.expander("🤖 AI 자동 설정", expanded=st.session_state.get("ai_panel_open", False)):
+        st.caption(
+            "문서 내용이나 특성을 붙여넣으면 AI가 분석해서 아래 Ingestion 옵션을 자동으로 설정합니다. "
+            "설정 후에도 직접 조정할 수 있습니다."
+        )
+
+        # ── 이전 적용 결과 배지 ───────────────────────────────────────
+        prev: "ConfigRecommendation | None" = st.session_state.get(_AI_CONFIG_RESULT_KEY)
+        if prev:
+            st.success(f"✅ **AI 설정 적용됨** — {prev.summary}")
+            badge_cols = st.columns(5)
+            badge_cols[0].info(f"📂 DOCX: `{prev.loader_docx}`")
+            badge_cols[1].info(f"✂️ {prev.splitter_strategy}")
+            badge_cols[2].info(f"📏 {prev.chunk_size} / {prev.chunk_overlap}")
+            badge_cols[3].info(f"🧠 {prev.embedding_model}")
+            badge_cols[4].info(f"🏷 prefix: {'✓' if prev.prepend_section_title else '✗'}")
+
+            if prev.reasoning:
+                with st.expander("📋 AI 추천 근거", expanded=False):
+                    for key, explanation in prev.reasoning.items():
+                        label_map = {
+                            "loader": "📂 로더",
+                            "splitter": "✂️ 청킹",
+                            "chunk_size": "📏 청크 크기",
+                            "embedding": "🧠 임베딩",
+                            "postprocess": "🔧 후처리",
+                        }
+                        label = label_map.get(key, f"▸ {key}")
+                        st.markdown(f"**{label}**: {explanation}")
+
+            if st.button("🔄 AI 설정 초기화", key="ai_config_reset"):
+                st.session_state.pop(_AI_CONFIG_RESULT_KEY, None)
+                st.rerun()
+
+            st.divider()
+
+        # ── 입력 영역 ────────────────────────────────────────────────
+        st.markdown("**📝 문서 설명 또는 샘플 내용 입력**")
+        st.caption(
+            "예시: '한국어 사규 문서로, 제1조~제20조 조항 구조, 표 포함, "
+            "급여/인사/경비 규정' 또는 실제 문서 일부를 붙여넣기"
+        )
+        desc = st.text_area(
+            "문서 특성 설명",
+            height=140,
+            key="ai_doc_description",
+            placeholder=(
+                "예시 1 (설명형):\n"
+                "한국어 기업 사규 문서 (규정/세칙), 조항(제N조) 구조, "
+                "표 포함(급여 기준표, 위임전결표), 전문 법률 용어 다수, "
+                "예상 질문: 조건형(~하면 얼마?), 절차형(어떻게 신청?)\n\n"
+                "예시 2 (텍스트 붙여넣기):\n"
+                "제1조 [목적] 이 규정은 임직원의 급여 지급 기준을 정함을 목적으로 한다.\n"
+                "제2조 [적용] 이 규정은 정규직 임직원에게 적용한다..."
+            ),
+            label_visibility="collapsed",
+        )
+
+        # ── Gemini API Key 확인 ──────────────────────────────────────
+        import os as _os
+        gemini_key = _os.getenv("GEMINI_API_KEY", "")
+        if not gemini_key:
+            st.warning(
+                "⚠️ GEMINI_API_KEY가 .env 파일에 없습니다. "
+                "AI 자동 설정을 사용하려면 키를 설정하세요."
+            )
+
+        # ── 분석 버튼 ────────────────────────────────────────────────
+        btn_disabled = not desc.strip() or not gemini_key
+        if st.button(
+            "🔍 분석 및 자동 설정",
+            key="ai_analyze_btn",
+            type="primary",
+            disabled=btn_disabled,
+            help="문서 설명을 AI로 분석해서 최적 설정을 자동 적용합니다.",
+        ):
+            with st.spinner("🤖 AI가 문서를 분석 중…"):
+                try:
+                    from ingestion.ai_config_advisor import AIConfigAdvisor
+                    advisor = AIConfigAdvisor()
+                    rec = advisor.recommend(desc)
+                    # Store for apply on next rerun (before widget render)
+                    st.session_state[_AI_CONFIG_KEY] = rec
+                    st.session_state["ai_panel_open"] = True
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ AI 분석 실패: {exc}")
+
+
 def render_upload_tab() -> None:
     active = _active_index()
     supported = sorted(FILE_LOADER_REGISTRY.keys())
@@ -740,6 +858,12 @@ def render_upload_tab() -> None:
     if _BATCH_RESULT_KEY in st.session_state:
         _render_batch_result(st.session_state[_BATCH_RESULT_KEY])
         st.divider()
+
+    # ── AI 자동 설정 적용 (rerun 후 위젯 렌더 전 반드시 먼저 실행) ─────
+    _apply_pending_ai_config()
+
+    # ── AI 자동 설정 패널 ─────────────────────────────────────────────
+    _render_ai_config_panel()
 
     # ── Ingestion options ─────────────────────────────────────────────
     with st.expander("⚙️ Ingestion 옵션", expanded=True):
@@ -1330,6 +1454,283 @@ def render_manage_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab: Excel → CSV 변환 및 인제스트
+# ---------------------------------------------------------------------------
+
+_EXCEL_RESULT_KEY = "excel_ingest_result"
+
+
+def _render_excel_ingest_result(results: list[tuple[str, bool, object]]) -> None:
+    """Display per-sheet ingest results (success / failure)."""
+    ok_sheets = [(name, res) for name, ok, res in results if ok]
+    fail_sheets = [(name, msg) for name, ok, msg in results if not ok]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("총 시트", f"{len(results)}개")
+    c2.metric("성공", f"{len(ok_sheets)}개")
+    c3.metric("실패", f"{len(fail_sheets)}개")
+
+    if ok_sheets:
+        st.success(f"✅ {len(ok_sheets)}개 시트 인제스트 완료")
+        for sheet_name, res in ok_sheets:
+            with st.expander(f"📋 {sheet_name} — {res.chunk_count}청크"):
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("청크 수", f"{res.chunk_count}개")
+                r2.metric("Embedding Dim", str(res.vector_dim))
+                r3.metric("총 텍스트", f"{res.total_text_length:,}자")
+                r4.metric("처리 시간", f"{res.elapsed_s:.2f}s")
+
+    if fail_sheets:
+        st.error(f"❌ {len(fail_sheets)}개 시트 실패")
+        for sheet_name, msg in fail_sheets:
+            st.error(f"**{sheet_name}**: {msg}")
+
+
+def render_excel_tab() -> None:
+    """📊 Excel → CSV 변환 · 미리보기 · 인제스트 탭."""
+    active = _active_index()
+
+    st.subheader("📊 Excel → CSV 변환 및 인제스트")
+    st.caption(
+        "xlsx 파일을 업로드하면 시트별로 데이터를 미리보고 검증한 뒤 "
+        "CSV로 다운로드하거나 바로 벡터 DB에 인제스트할 수 있습니다."
+    )
+
+    # ── openpyxl 설치 안내 ────────────────────────────────────────────────
+    try:
+        import openpyxl  # type: ignore[import]  # noqa: F401
+    except ImportError:
+        st.warning(
+            "⚠️ **openpyxl** 패키지가 필요합니다.\n\n"
+            "터미널에서 아래 명령어를 실행하세요:\n```\nuv add openpyxl\n```\n"
+            "또는 아래 버튼으로 자동 설치합니다."
+        )
+        if st.button("📦 openpyxl 자동 설치", key="install_openpyxl"):
+            with st.spinner("openpyxl 설치 중…"):
+                from ingestion.pkg_installer import install_package
+                ok, msg = install_package("openpyxl")
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(f"설치 실패: {msg}")
+        return
+
+    # ── 이전 인제스트 결과 ────────────────────────────────────────────────
+    if _EXCEL_RESULT_KEY in st.session_state:
+        _render_excel_ingest_result(st.session_state[_EXCEL_RESULT_KEY])
+        if st.button("🔄 결과 지우기", key="excel_clear_result"):
+            st.session_state.pop(_EXCEL_RESULT_KEY, None)
+            st.rerun()
+        st.divider()
+
+    # ── 파일 업로드 ───────────────────────────────────────────────────────
+    uploaded = st.file_uploader(
+        "Excel 파일 업로드 (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=False,
+        key="excel_uploader",
+        help="여러 시트가 있는 경우 시트별로 미리보기와 인제스트 여부를 선택할 수 있습니다.",
+    )
+
+    if not uploaded:
+        st.info("xlsx 파일을 업로드하면 시트별 미리보기가 표시됩니다.")
+        return
+
+    # ── 시트 파싱 ─────────────────────────────────────────────────────────
+    try:
+        from ingestion.excel_converter import load_excel_sheets
+        sheets = load_excel_sheets(uploaded.getvalue(), uploaded.name)
+    except Exception as exc:
+        st.error(f"❌ Excel 파싱 실패: {exc}")
+        return
+
+    st.success(
+        f"✅ **{uploaded.name}** 파싱 완료 — "
+        f"시트 **{len(sheets)}개** | "
+        f"총 행 **{sum(s.row_count for s in sheets):,}개**"
+    )
+    st.divider()
+
+    # ── 시트별 미리보기 + 설정 ────────────────────────────────────────────
+    st.markdown("### 📋 시트별 미리보기 및 설정")
+    st.caption(
+        "각 시트 탭에서 데이터를 확인하고, 인제스트에 포함할 시트를 선택하세요. "
+        "'그룹 미리보기' 탭에서 섹션 단위로 어떻게 묶일지 확인할 수 있습니다."
+    )
+
+    include_flags: dict[str, bool] = {}
+    rps_map: dict[str, int] = {}
+
+    sheet_tabs = st.tabs([f"{'📋'} {s.name}" for s in sheets])
+
+    for tab, sheet in zip(sheet_tabs, sheets):
+        with tab:
+            # ── 시트 헤더 ─────────────────────────────────────────────
+            h1, h2, h3 = st.columns([2, 1, 1])
+            h1.markdown(f"**{sheet.name}**")
+            h2.metric("행 수", f"{sheet.row_count:,}")
+            h3.metric("열 수", f"{sheet.col_count}")
+
+            ctl1, ctl2 = st.columns([1, 1])
+            include = ctl1.checkbox(
+                "인제스트에 포함",
+                value=True,
+                key=f"excel_inc_{sheet.name}",
+            )
+            rps = ctl2.number_input(
+                "행/섹션 (rows per section)",
+                min_value=1,
+                max_value=200,
+                value=15,
+                step=5,
+                key=f"excel_rps_{sheet.name}",
+                help=(
+                    "인제스트 시 몇 행을 하나의 섹션으로 묶을지 설정합니다. "
+                    "위임전결표처럼 행마다 의미가 있는 경우 10–20을 권장합니다."
+                ),
+            )
+            include_flags[sheet.name] = include
+            rps_map[sheet.name] = int(rps)
+
+            st.divider()
+
+            # ── 미리보기 탭 (데이터 테이블 / 그룹 미리보기) ───────────
+            preview_tab, group_tab = st.tabs(["📊 데이터 미리보기", "🗂 섹션 그룹 미리보기"])
+
+            with preview_tab:
+                preview_df = sheet.preview_df(max_rows=50)
+                st.dataframe(preview_df, use_container_width=True, height=320)
+                if sheet.row_count > 50:
+                    st.caption(
+                        f"처음 50행만 표시 중 (전체 {sheet.row_count:,}행)"
+                    )
+                st.markdown(f"**컬럼 목록:** {', '.join(f'`{c}`' for c in sheet.columns)}")
+
+            with group_tab:
+                groups = sheet.grouped_preview(rows_per_group=rps_map[sheet.name])
+                if groups:
+                    st.caption(
+                        f"rows_per_section={rps_map[sheet.name]} 기준으로 "
+                        f"**{len(groups)}개 섹션**으로 분할됩니다."
+                    )
+                    # Show first 10 groups
+                    for g in groups[:10]:
+                        with st.expander(
+                            f"{g['label']} ({g['row_range']}, {g['rows']}행)",
+                            expanded=False,
+                        ):
+                            st.caption(g["sample"])
+                    if len(groups) > 10:
+                        st.caption(f"… 나머지 {len(groups) - 10}개 섹션은 생략됩니다.")
+                else:
+                    st.info("데이터가 없습니다.")
+
+            st.divider()
+
+            # ── CSV 다운로드 ───────────────────────────────────────────
+            csv_bytes = sheet.to_csv_bytes()
+            st.download_button(
+                label=f"⬇️ CSV 다운로드 ({sheet.csv_filename})",
+                data=csv_bytes,
+                file_name=sheet.csv_filename,
+                mime="text/csv; charset=utf-8-sig",
+                key=f"excel_dl_{sheet.name}",
+                help="변환된 CSV 파일을 다운로드합니다. 내용을 확인 후 '문서 추가' 탭에서 업로드할 수도 있습니다.",
+            )
+
+    # ── 인제스트 섹션 ─────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📥 인제스트")
+
+    included_sheets = [s for s in sheets if include_flags.get(s.name, True)]
+
+    if not included_sheets:
+        st.warning("인제스트할 시트를 최소 하나 이상 선택하세요.")
+        return
+
+    if not active:
+        st.warning("⚠️ 사이드바에서 Index를 먼저 선택하거나 생성하세요.")
+        return
+
+    # 인제스트 대상 요약
+    summary_data = [
+        {
+            "시트": s.name,
+            "행 수": s.row_count,
+            "열 수": s.col_count,
+            "행/섹션": rps_map[s.name],
+            "예상 섹션": -(-s.row_count // rps_map[s.name]),  # ceiling div
+            "CSV 파일명": s.csv_filename,
+        }
+        for s in included_sheets
+    ]
+    try:
+        import pandas as pd
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+    except Exception:
+        for row in summary_data:
+            st.markdown(
+                f"- **{row['시트']}** — {row['행 수']}행 / {row['행/섹션']}행 섹션 → "
+                f"약 {row['예상 섹션']}섹션 → `{row['CSV 파일명']}`"
+            )
+
+    st.info(
+        f"선택 Index: **`{active}`** | "
+        f"대상 시트: **{len(included_sheets)}개** | "
+        f"총 행: **{sum(s.row_count for s in included_sheets):,}개**\n\n"
+        "각 시트는 독립적인 CSV 문서로 인제스트됩니다. "
+        "Ingestion 옵션(임베딩 모델, 청킹 전략 등)은 **'문서 추가'** 탭의 설정을 따릅니다."
+    )
+
+    if st.button(
+        f"📥 선택 시트 인제스트 ({len(included_sheets)}개) → `{active}`",
+        type="primary",
+        key="excel_ingest_btn",
+    ):
+        config = _build_ingestion_config()
+        ingestor = _load_ingestor()
+        results: list[tuple[str, bool, object]] = []
+
+        progress = st.progress(0.0, text="인제스트 준비 중…")
+
+        for i, sheet in enumerate(included_sheets):
+            progress.progress(
+                i / len(included_sheets),
+                text=f"처리 중 ({i + 1}/{len(included_sheets)}): {sheet.name}",
+            )
+
+            # rows_per_section을 메타데이터로 전달해 로더에서 참고할 수 있도록 기록
+            sheet_config = IngestionConfig(
+                **{
+                    **config,
+                    "metadata": {
+                        **config.get("metadata", {}),
+                        "excel_source": uploaded.name,
+                        "excel_sheet": sheet.name,
+                        "rows_per_section": rps_map[sheet.name],
+                    },
+                }
+            )
+
+            try:
+                csv_bytes = sheet.to_csv_bytes()
+                res = ingestor.ingest_with_config(
+                    csv_bytes,
+                    sheet.csv_filename,
+                    active,
+                    sheet_config,
+                )
+                results.append((sheet.name, True, res))
+            except Exception as exc:
+                results.append((sheet.name, False, str(exc)))
+
+        progress.progress(1.0, text="완료")
+        st.session_state[_EXCEL_RESULT_KEY] = results
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1343,8 +1744,9 @@ def main() -> None:
 
     render_sidebar()
 
-    tab_upload, tab_search, tab_compare, tab_manage = st.tabs([
+    tab_upload, tab_excel, tab_search, tab_compare, tab_manage = st.tabs([
         "📤 문서 추가",
+        "📊 Excel 변환",
         "🔍 검색",
         "⚖️ Index 비교",
         "🗂 관리",
@@ -1352,6 +1754,8 @@ def main() -> None:
 
     with tab_upload:
         render_upload_tab()
+    with tab_excel:
+        render_excel_tab()
     with tab_search:
         render_search_tab()
     with tab_compare:

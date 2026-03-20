@@ -26,15 +26,13 @@ from llm.upstage_provider import UpstageProvider
 
 load_dotenv()
 
-# Ordered: Upstage first (UPSTAGE_API_KEY already configured for embeddings)
+# Ordered: Company first (사내 vLLM 기본값), then cloud providers
 PROVIDER_MODELS: dict[str, list[str]] = {
+    "Company": CompanyProvider.MODELS,
     "Upstage": UpstageProvider.MODELS,
     "OpenAI": OpenAIProvider.MODELS,
     "Claude": ClaudeProvider.MODELS,
     "Gemini": GeminiProvider.MODELS,
-    # Company server: model list resolved dynamically from /v1/models at runtime.
-    # Shown here with fallback names; actual list is refreshed on provider init.
-    "Company": CompanyProvider.MODELS,
 }
 
 # None  → no API key required (Company uses api_key="EMPTY" internally)

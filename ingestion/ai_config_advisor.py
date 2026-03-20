@@ -103,42 +103,29 @@ class AIConfigAdvisor:
     """
     LLM-based ingestion config advisor.
 
-    Uses Gemini (default) via the project's GeminiProvider.
-    Falls back to environment-provided ANTHROPIC_API_KEY or OPENAI_API_KEY if needed.
+    Supports all project LLM providers (Company, Upstage, OpenAI, Claude, Gemini).
+    Defaults to the Company (on-premise vLLM) provider.
     """
-
-    DEFAULT_MODEL = "gemini-2.5-flash"
 
     def __init__(
         self,
-        api_key: str | None = None,
+        provider_name: str = "Company",
         model: str | None = None,
     ) -> None:
         """
         Parameters
         ----------
-        api_key:
-            Gemini API key. Falls back to GEMINI_API_KEY env var.
+        provider_name:
+            Provider name matching ``llm.PROVIDER_MODELS`` keys.
+            Defaults to ``"Company"`` (on-premise vLLM).
         model:
-            Gemini model name. Defaults to ``gemini-2.5-flash``.
+            Model name. If *None*, the first model of the chosen provider is used.
         """
-        # Load .env so GEMINI_API_KEY is available even without explicit pass
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-        except ImportError:
-            pass
-        self._api_key = api_key or os.getenv("GEMINI_API_KEY") or ""
-        self._model = model or self.DEFAULT_MODEL
+        from llm import get_provider, PROVIDER_MODELS
 
-        if not self._api_key:
-            raise ValueError(
-                "Gemini API 키가 없습니다. .env 파일에 GEMINI_API_KEY를 설정하세요."
-            )
-
-        # Import the project's GeminiProvider
-        from llm.gemini_provider import GeminiProvider
-        self._provider = GeminiProvider(api_key=self._api_key)
+        self._provider = get_provider(provider_name)
+        models = PROVIDER_MODELS.get(provider_name, [])
+        self._model = model or (models[0] if models else "")
 
     # ------------------------------------------------------------------
     # Public API

@@ -801,17 +801,31 @@ def _render_ai_config_panel() -> None:
             label_visibility="collapsed",
         )
 
-        # ── Gemini API Key 확인 ──────────────────────────────────────
-        import os as _os
-        gemini_key = _os.getenv("GEMINI_API_KEY", "")
-        if not gemini_key:
-            st.warning(
-                "⚠️ GEMINI_API_KEY가 .env 파일에 없습니다. "
-                "AI 자동 설정을 사용하려면 키를 설정하세요."
-            )
+        # ── LLM 모델 선택 ─────────────────────────────────────────────
+        from llm import PROVIDER_MODELS, available_providers as _avail_providers
+        _ready = _avail_providers()
+        _all_prov = list(PROVIDER_MODELS.keys())
+
+        mc1, mc2 = st.columns(2)
+        ai_provider = mc1.selectbox(
+            "LLM Provider",
+            _all_prov,
+            key="ai_cfg_provider",
+            format_func=lambda p: f"{'✅' if p in _ready else '⚠️'} {p}",
+        )
+        ai_model = mc2.selectbox(
+            "모델",
+            PROVIDER_MODELS[ai_provider],
+            key="ai_cfg_model",
+        )
 
         # ── 분석 버튼 ────────────────────────────────────────────────
-        btn_disabled = not desc.strip() or not gemini_key
+        btn_disabled = not desc.strip() or (ai_provider not in _ready)
+        if ai_provider not in _ready:
+            from llm import _PROVIDER_ENV
+            _env = _PROVIDER_ENV.get(ai_provider, "")
+            st.warning(f"⚠️ `{_env}` 환경변수가 없습니다. `.env` 파일에 추가하세요.")
+
         if st.button(
             "🔍 분석 및 자동 설정",
             key="ai_analyze_btn",
@@ -822,9 +836,8 @@ def _render_ai_config_panel() -> None:
             with st.spinner("🤖 AI가 문서를 분석 중…"):
                 try:
                     from ingestion.ai_config_advisor import AIConfigAdvisor
-                    advisor = AIConfigAdvisor()
+                    advisor = AIConfigAdvisor(provider_name=ai_provider, model=ai_model)
                     rec = advisor.recommend(desc)
-                    # Store for apply on next rerun (before widget render)
                     st.session_state[_AI_CONFIG_KEY] = rec
                     st.session_state["ai_panel_open"] = True
                     st.rerun()
